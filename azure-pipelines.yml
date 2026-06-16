@@ -1,0 +1,280 @@
+#-----------------------------------
+# TRIGGERS
+#-----------------------------------
+
+trigger:
+  - prod                      # Run this pipeline when code is pushed to the branch
+
+#-----------------------------------
+# AGENT POOL
+#-----------------------------------
+pool:
+  name: Default
+
+#-----------------------------------
+# VARIABLES
+#-----------------------------------
+variables:
+  # 1. Add your Variable Group here (where PAT is stored)
+  - group: PAT-token
+  - template: vars/prod.yml
+
+stages:
+#===============================
+# STAGE 1: BUILD
+#===============================
+- stage: Build
+  displayName: 'Build & Package Lambda'
+  condition: eq(variables['rollbackversion'], '')
+  jobs:
+  - job: BuildAndPublish
+    displayName: 'Build and Publish Lambda Artifact'
+    steps:
+
+    - task: CopyFiles@2
+      displayName: 'Copy source files'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: |
+          **/*
+          !README.md
+          !azure-pipelines.yml
+          !.gitattributes
+          !.gitignore
+        TargetFolder: '$(artifactStagingDirectory)'
+
+    - task: ArchiveFiles@2
+      displayName: 'Archiving Files'
+      inputs:
+        rootFolderOrFile: '$(artifactStagingDirectory)'     # Zip files in staging dir
+        includeRootFolder: false
+        archiveType: 'zip'
+        archiveFile: '$(Build.ArtifactStagingDirectory)/lambda-code.zip'
+        replaceExistingArchive: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Artifact'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'  # Publish zipped file
+        ArtifactName: 'Lambda-code'
+        publishLocation: 'Container'
+
+
+    - script: |
+        # Sanitize message for use in AWS Lambda description (no newlines, escape quotes)
+        COMMIT_MESSAGE_RAW="$(Build.SourceVersionMessage)"
+        COMMIT_MESSAGE_SANITIZED=$(echo "$COMMIT_MESSAGE_RAW" | tr '\n' ' ' | sed 's/"/\\"/g' | cut -c 1-256)
+        echo "##vso[task.setvariable variable=CommitMessage]$COMMIT_MESSAGE_SANITIZED"
+      displayName: 'Capture and Sanitize Commit Message'
+      name: SetVarStep 
+
+#===============================
+# STAGE 2: APPROVAL (PROD ONLY)
+#===============================
+- stage: Approval
+  displayName: 'Manual approval (prod only)'
+  dependsOn: Build
+  condition: eq(variables['Build.SourceBranchName'], 'prod')
+
+  jobs:
+  - job: ProdApproval
+    displayName: 'Approval before Lambda deploy'
+    pool: server
+    timeoutInMinutes: 10   # 10 minutes
+
+    steps:
+    - task: ManualValidation@0
+      displayName: 'Approve PROD deployment'
+      inputs:
+        instructions: |
+          Deployment requested for PROD branch.
+          Lambda Target: $(lambdaFunctionName)
+          Artifact: Lambda-code
+          Please review and approve or reject.
+        notifyUsers: |
+          $(APPROVAL_USERS)
+        onTimeout: 'reject'
+
+#===============================
+# STAGE 3: DEPLOY
+#===============================
+- stage: Deploy
+  displayName: 'Deploy Lambda'
+  variables:
+    # Map the variable from Stage 1 (Build), Job (BuildAndPublish), Step (SetVarStep)
+    CommitMessage: $[ stageDependencies.Build.BuildAndPublish.outputs['SetVarStep.CommitMessage'] ]
+  dependsOn:
+    - Build
+    - Approval
+  condition: |
+    or(
+      ne(variables['Build.SourceBranchName'], 'prod'),
+      eq(dependencies.Approval.result, 'Succeeded')
+    )
+
+  jobs:
+  #-------------------------------------------------
+  # JOB 1: NORMAL DEPLOY (publish new version)
+  #-------------------------------------------------
+  - job: DeployLambda
+    displayName: 'Deploy to AWS Lambda'
+    condition: eq(variables['rollbackversion'], '')
+    steps:
+
+    - download: current
+      artifact: Lambda-code
+
+    - task: AWSShellScript@1
+      name: DeployStep
+      displayName: 'Deploy & publish Lambda'
+      
+      inputs:
+        awsCredentials: 'Azure-AWS-Service-Connection'     # AWS service connection name in Azure DevOps
+        regionName: 'ap-south-1'                           # AWS Region
+        scriptType: 'inline'
+        inlineScript: |
+          set -euo pipefail
+          set -x
+
+          ZIP="$(Pipeline.Workspace)/Lambda-code/lambda-code.zip"
+          # Update function code
+          echo "Updating function code"
+          aws lambda update-function-code \
+            --function-name "$(lambdaFunctionName)" \
+            --zip-file "fileb://$ZIP"
+          
+          # Wait for the code update to complete
+          echo "Waiting for code update to complete..."
+          aws lambda wait function-updated-v2 --function-name "$(lambdaFunctionName)"
+
+          # Publish a new version
+          echo "Publishing new version with correct description..."
+          VERSION=$(aws lambda publish-version \
+            --function-name "$(lambdaFunctionName)" \
+            --description "$(CommitMessage)" \
+            --query 'Version' \
+            --output text)
+
+          echo "Successfully published version: $VERSION"
+          echo "##vso[task.setvariable variable=LambdaVersion]$VERSION"
+          echo "##vso[task.setvariable variable=LambdaVersion;isOutput=true]$VERSION"
+          
+
+    # STEP 2: CHECK IF ALIAS IS PROVIDED
+    - script: |
+        if [ -z "$(alias)" ]; then
+          echo "No alias provided, skipping alias update."
+        else
+          echo "Alias provided: $(alias). Updating alias to version $(LambdaVersion)..."
+        fi
+      displayName: 'Check alias and log status'
+
+    # STEP 3: UPDATE ALIAS (IF PROVIDED)
+    - task: AWSCLI@1
+      displayName: 'Update Lambda alias'
+      condition: and(succeeded(), ne(variables['alias'], ''))  # Only run if alias is not empty
+      inputs:
+        awsCredentials: 'Azure-AWS-Service-Connection'
+        regionName: 'ap-south-1'
+        awsCommand: 'lambda'
+        awsSubCommand: 'update-alias'
+        awsArguments: >
+          --function-name "$(lambdaFunctionName)"
+          --name "$(alias)"
+          --function-version $(LambdaVersion)"
+
+  #-------------------------------------------------
+  # JOB 2: ROLLBACK (alias only, no publish)
+  #-------------------------------------------------
+
+  - job: Deploy_Rollback
+    displayName: 'Rollback Lambda (alias only)'
+    condition: ne(variables['rollbackversion'], '')
+    steps:
+
+    - task: AWSCLI@1
+      displayName: 'Rollback alias to existing version'
+      inputs:
+        awsCredentials: Azure-AWS-Service-Connection
+        regionName: ap-south-1
+        awsCommand: lambda
+        awsSubCommand: update-alias
+        awsArguments: >
+          --function-name "$(lambdaFunctionName)"
+          --name "$(alias)"
+          --function-version $(rollbackversion)
+          --description "Rollback to version $(rollbackversion)"
+
+    - script: |
+        echo "Setting output variable for next job..."
+        echo "##vso[task.setvariable variable=LambdaVersion;isOutput=true]$(rollbackversion)"
+      name: RollbackStep 
+      displayName: 'Set Output Variable'
+
+#-------------------------------------------------
+  # JOB 3: Azure Board
+  #-------------------------------------------------
+  - job: Azure_Board
+    displayName: 'Update Azure Board'
+    dependsOn:
+    - DeployLambda
+    - Deploy_Rollback
+    condition: or(succeeded('DeployLambda'), succeeded('Deploy_Rollback'))
+    variables:
+      FinalLambdaVersion: $[ 
+        coalesce(
+          dependencies.DeployLambda.outputs['DeployStep.LambdaVersion'], 
+          dependencies.Deploy_Rollback.outputs['RollbackStep.LambdaVersion']
+        ) 
+        ]
+    steps:
+    - checkout: self
+
+    # FIX: Use Bash@3 to run the python file. 
+    - task: Bash@3
+      displayName: 'Run Azure Boards Script'
+      env:
+        ORG: cloudthat-IPL
+        PROJECT: CostSheet
+        AZDO_PAT: $(AZDO_PAT)
+        APP_NAME: $(Build.Repository.Name)
+        ENVIRONMENT: $(Build.SourceBranchName)
+        LAMBDA_NAME: $(lambdaFunctionName)
+        LAMBDA_VERSION: $(FinalLambdaVersion)
+        ROLLBACK_VERSION: $(rollbackversion)
+        ALIAS: $(alias)
+        BUILD_ID: $(Build.BuildId)
+        COMMIT_MSG: $(CommitMessage)
+        COMMIT_HASH: $(Build.SourceVersion)
+      inputs:
+        targetType: 'inline'  
+        script: |
+          # Explicitly run the python interpreter on the file
+          python3 "$(System.DefaultWorkingDirectory)/scripts/update_board.py"
+
+#===============================
+# STAGE 4: CLEANUP (ALWAYS RUN)
+#===============================
+- stage: Cleanup
+  displayName: 'Cleanup & shutdown'
+  condition: always()
+
+  jobs:
+  - job: CleanupAndShutdown
+    displayName: 'Shutdown agent & clean workspace'
+    steps:
+
+    - task: DeleteFiles@1
+      displayName: 'Clean workspace (current run)'
+      condition: always()
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)'
+        Contents: '**/*'
+        RemoveSourceFolder: true
+
+    - task: CmdLine@2
+      displayName: 'Shutdown self-hosted EC2 agent'
+      condition: always()
+      inputs:
+        script: |
+          curl "https://5p659fsw5j.execute-api.ap-south-1.amazonaws.com/self-stage/selfhosted?action=stop"
